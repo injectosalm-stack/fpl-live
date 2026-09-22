@@ -1,0 +1,68 @@
+name: fpl-live
+
+on:
+  # Fallback schedule. GitHub can fire these 5-15 min late under load,
+  # which is why the Cloudflare cron also exists (it pokes workflow_dispatch).
+  schedule:
+    - cron: "*/5 * * * *"
+
+  # Poked by the Cloudflare Worker cron — this is the on-time path.
+  workflow_dispatch:
+    inputs:
+      triggered_by:
+        description: "who triggered this"
+        default: "manual"
+
+  # Re-run automatically when you change the compute code.
+  push:
+    branches: [main]
+    paths: ["server/**", ".github/workflows/fpl-live.yml"]
+
+# Never let two runs overlap - they would fight over the same cache.
+concurrency:
+  group: fpl-live
+  cancel-in-progress: false
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install --quiet requests
+
+      # The picks cache is the whole point: without it every run re-downloads
+      # 13,000 teams. Keyed per gameweek so it resets naturally each week.
+      - name: Resolve current gameweek
+        id: gw
+        run: |
+          GW=$(python -c "import sys; sys.path.insert(0,'server'); from aggregate import current_gameweek; print(current_gameweek())")
+          echo "gw=$GW" >> "$GITHUB_OUTPUT"
+          echo "current gameweek: $GW"
+
+      - uses: actions/cache@v4
+        with:
+          path: server/_cache
+          key: fpl-picks-gw${{ steps.gw.outputs.gw }}
+          restore-keys: fpl-picks-gw${{ steps.gw.outputs.gw }}
+
+      - name: Compute + upload
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: python server/aggregate.py --upload
+
+      - name: Save the picks cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: server/_cache
+          key: fpl-picks-gw${{ steps.gw.outputs.gw }}-${{ github.run_number }}
